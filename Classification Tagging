@@ -1,0 +1,372 @@
+"""
+fill_materiality_long_transcripts.py
+
+Usage example:
+python fill_materiality_long_transcripts.py --input_xlsx data.xlsx --sheet "Sheet1" \
+  --text_col "call transcripts" --label_col "materiality" \
+  --model "sentence-transformers/all-mpnet-base-v2" --method prototype --calibrate
+
+Requirements:
+  pip install sentence-transformers transformers scikit-learn pandas numpy openpyxl tqdm
+
+Notes:
+ - For long transcripts we chunk by tokenizer token ids (respects model_max_length).
+ - By default this calibrates threshold (20% val split) to maximize macro F1.
+ - Output Excel contains final_materiality and predictions for blanks.
+"""
+
+import argparse
+import math
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, classification_report
+from sentence_transformers import SentenceTransformer, util
+from transformers import AutoTokenizer
+import torch
+
+# ----------------------------
+# Defaults
+# ----------------------------
+DEFAULT_MODEL = "sentence-transformers/all-mpnet-base-v2"
+# DEFAULT_MODEL = "intfloat/multilingual-e5-large"  # multilingual option
+DEFAULT_METHOD = "prototype"   # "prototype" or "knn"
+DEFAULT_K = 5
+DEFAULT_THRESHOLD = 0.75
+CALIBRATE = True
+RANDOM_STATE = 42
+BATCH_SIZE = 8   # encoding chunks per transcript is small; per-chunk batch is handled inside model.encode
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def normalise_label(s):
+    """Turn raw labels into 'COMPLAINT' / 'CONCERN' or None"""
+    if pd.isna(s):
+        return None
+    s = str(s).strip().upper()
+    if s.startswith("COMPL"):
+        return "COMPLAINT"
+    if s.startswith("CONC"):
+        return "CONCERN"
+    return None
+
+def tokenize_to_id_chunks(tokenizer, text, chunk_size):
+    """Return list of token-id chunks (lists of ints) for text (no special tokens)."""
+    # tokenizer.encode returns list of ids (including special tokens sometimes depending on settings)
+    # Use tokenizer.encode to get full id list without truncation
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) == 0:
+        return []
+    chunks = [ids[i:i+chunk_size] for i in range(0, len(ids), chunk_size)]
+    return chunks
+
+def decode_id_chunk(tokenizer, id_chunk):
+    """Decode token ids back to str (skip special tokens)."""
+    return tokenizer.decode(id_chunk, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+def encode_long_text(model, tokenizer, text, chunk_size=None):
+    """
+    Encode a long text by:
+      - tokenizing to ids
+      - splitting ids into chunks of chunk_size
+      - decoding each chunk to text
+      - encoding chunks with model.encode
+      - mean-pooling chunk embeddings into single vector (normalized)
+    Returns: numpy array (dim,)
+    """
+    if not isinstance(text, str) or text.strip() == "":
+        # return zero vector of correct dim
+        dim = model.get_sentence_embedding_dimension()
+        return np.zeros(dim, dtype=float)
+
+    if chunk_size is None:
+        # fallback: model tokenizer model_max_length minus some margin
+        max_len = tokenizer.model_max_length if hasattr(tokenizer, "model_max_length") else 512
+        chunk_size = max(64, max_len - 10)
+
+    id_chunks = tokenize_to_id_chunks(tokenizer, text, chunk_size)
+    if len(id_chunks) == 0:
+        dim = model.get_sentence_embedding_dimension()
+        return np.zeros(dim, dtype=float)
+
+    # decode id_chunks to text chunks
+    text_chunks = [decode_id_chunk(tokenizer, c) for c in id_chunks]
+    # encode chunks — let model handle batching
+    # convert_to_tensor=True returns torch tensor; we will mean-pool then convert to numpy
+    with torch.no_grad():
+        chunk_embs = model.encode(text_chunks, batch_size=BATCH_SIZE, convert_to_tensor=True, show_progress_bar=False, normalize_embeddings=True)
+        # mean pool across chunk dimension
+        pooled = torch.mean(chunk_embs, dim=0)
+        pooled = pooled / (pooled.norm(p=2) + 1e-9)
+        return pooled.cpu().numpy()
+
+def build_centroids(embeddings, labels):
+    """
+    embeddings: np.array (n_samples x dim)
+    labels: list or array of strings ("COMPLAINT"/"CONCERN")
+    returns dict label->centroid (numpy, normalized)
+    """
+    lab_arr = np.array(labels)
+    centroids = {}
+    for lab in np.unique(lab_arr):
+        mask = (lab_arr == lab)
+        if mask.sum() == 0:
+            continue
+        centroid = embeddings[mask].mean(axis=0)
+        norm = np.linalg.norm(centroid) + 1e-9
+        centroids[lab] = centroid / norm
+    return centroids
+
+def predict_prototype(centroids, emb):
+    sims = {lab: float(np.dot(centroids[lab], emb)) for lab in centroids}
+    best_lab = max(sims, key=sims.get)
+    return best_lab, sims[best_lab], sims
+
+def knn_predict(labeled_embs, labeled_labels, emb, k=5):
+    """
+    labeled_embs: np.array (n_labeled, dim)
+    emb: np.array (dim,)
+    returns majority_label, top_sim
+    """
+    sims = (labeled_embs @ emb)  # if both numpy normalized vectors, dot is cosine
+    top_idx = np.argsort(-sims)[:k]
+    top_labels = np.array(labeled_labels)[top_idx]
+    unique, counts = np.unique(top_labels, return_counts=True)
+    majority_label = unique[np.argmax(counts)]
+    return majority_label, float(sims[top_idx[0]]), top_labels.tolist()
+
+# ----------------------------
+# Calibration
+# ----------------------------
+def calibrate_threshold(model, tokenizer, labeled_texts, labeled_labels, method="prototype", k=5, seed=RANDOM_STATE):
+    """
+    Splits labeled_texts -> train/val, encodes train/val (using chunk pooling), builds centroids or uses knn,
+    then tries thresholds in [0.5,0.95] and finds best macro-F1 on val.
+    Returns best_threshold, best_macro_f1
+    """
+    X_train_texts, X_val_texts, y_train, y_val = train_test_split(
+        labeled_texts, labeled_labels, test_size=0.2, random_state=seed, stratify=labeled_labels
+    )
+
+    # encode train and val
+    print("Encoding calibration TRAIN set (this can be slow)...")
+    emb_train = np.vstack([encode_long_text(model, tokenizer, t) for t in tqdm(X_train_texts, desc="enc train")])
+    print("Encoding calibration VAL set...")
+    emb_val = np.vstack([encode_long_text(model, tokenizer, t) for t in tqdm(X_val_texts, desc="enc val")])
+
+    if method == "prototype":
+        centroids = build_centroids(emb_train, y_train)
+        val_sims = []
+        val_base_preds = []
+        for e in emb_val:
+            # compute sim to centroids
+            sims = {lab: float(np.dot(centroids[lab], e)) for lab in centroids}
+            best_lab = max(sims, key=sims.get)
+            val_base_preds.append(best_lab)
+            val_sims.append(sims[best_lab])
+    else:
+        # knn: use emb_train & y_train as pool
+        val_sims = []
+        val_base_preds = []
+        for e in emb_val:
+            pred_label, top_sim, _ = knn_predict(emb_train, y_train, e, k=k)
+            val_base_preds.append(pred_label)
+            val_sims.append(top_sim)
+
+    thresholds = np.linspace(0.50, 0.95, 46)
+    best_thr = thresholds[0]
+    best_f1 = -1
+    best_report = None
+    print("Calibrating threshold...")
+    for thr in thresholds:
+        y_pred_thr = [lab if sim >= thr else "NEUTRAL" for lab, sim in zip(val_base_preds, val_sims)]
+        # Compute macro f1 on the two real classes
+        try:
+            f1 = f1_score(y_val, y_pred_thr, labels=["COMPLAINT", "CONCERN"], average="macro")
+        except Exception:
+            f1 = -1
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = thr
+            # store classification report optionally
+            best_report = classification_report(y_val, y_pred_thr, labels=["COMPLAINT", "CONCERN"], output_dict=True)
+    return best_thr, best_f1, best_report
+
+# ----------------------------
+# Main fill function
+# ----------------------------
+def fill_blanks_from_excel(
+    input_xlsx,
+    sheet,
+    text_col="call transcripts",
+    label_col="materiality",
+    model_name=DEFAULT_MODEL,
+    method=DEFAULT_METHOD,
+    k=DEFAULT_K,
+    threshold=DEFAULT_THRESHOLD,
+    calibrate=CALIBRATE,
+    output_xlsx="materiality_filled.xlsx",
+):
+    # Read Excel
+    df = pd.read_excel(input_xlsx, sheet_name=sheet)
+    if text_col not in df.columns or label_col not in df.columns:
+        raise ValueError(f"Make sure columns '{text_col}' and '{label_col}' exist. Found: {list(df.columns)}")
+
+    # Normalize labels
+    df = df.copy()
+    df["_label_norm"] = df[label_col].apply(normalise_label)
+
+    labeled_df = df[df["_label_norm"].notnull()].reset_index(drop=True)
+    unlabeled_df = df[df["_label_norm"].isnull()].reset_index(drop=True)
+
+    print(f"Total rows: {len(df)} | Labeled: {len(labeled_df)} | Unlabeled(blanks): {len(unlabeled_df)}")
+    if len(labeled_df) < 50:
+        print("Warning: fewer than 50 labeled rows; calibration and centroid quality may be poor.")
+
+    # Load model & tokenizer
+    print("Loading model and tokenizer:", model_name)
+    model = SentenceTransformer(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+    # Determine chunk size using tokenizer.model_max_length
+    model_max = tokenizer.model_max_length if hasattr(tokenizer, "model_max_length") else 512
+    chunk_size = max(64, model_max - 10)
+    print(f"Tokenizer model_max_length={model_max}; using chunk_size={chunk_size} token ids per chunk.")
+
+    # Encode labeled texts (with chunk pooling)
+    labeled_texts = labeled_df[text_col].fillna("").astype(str).tolist()
+    print("Encoding labeled texts (this can take time)...")
+    labeled_embs = []
+    for t in tqdm(labeled_texts, desc="encode labeled"):
+        emb = encode_long_text(model, tokenizer, t, chunk_size=chunk_size)
+        labeled_embs.append(emb)
+    labeled_embs = np.vstack(labeled_embs) if len(labeled_embs) > 0 else np.zeros((0, model.get_sentence_embedding_dimension()))
+    labeled_labels = labeled_df["_label_norm"].tolist()
+
+    # Calibrate threshold (optional)
+    chosen_threshold = threshold
+    if calibrate and len(labeled_df) >= 20:
+        print("Running calibration to pick similarity threshold...")
+        best_thr, best_f1, best_report = calibrate_threshold = calibrate_threshold  # placeholder for lint
+        best_thr, best_f1, best_report = calibrate_threshold(model, tokenizer, labeled_texts, labeled_labels, method=method, k=k)
+        print(f"Calibration result: best_threshold={best_thr:.3f}, best_macro_f1={best_f1:.3f}")
+        chosen_threshold = best_thr
+
+    # Build centroids for prototype
+    centroids = None
+    if method == "prototype":
+        centroids = build_centroids(labeled_embs, labeled_labels)
+
+    # Encode unlabeled texts
+    unl_texts = unlabeled_df[text_col].fillna("").astype(str).tolist()
+    print(f"Encoding {len(unl_texts)} unlabeled transcripts...")
+    unl_embs = []
+    for t in tqdm(unl_texts, desc="encode unlabeled"):
+        unl_embs.append(encode_long_text(model, tokenizer, t, chunk_size=chunk_size))
+    unl_embs = np.vstack(unl_embs) if len(unl_embs) > 0 else np.zeros((0, model.get_sentence_embedding_dimension()))
+
+    # Predict
+    preds = []
+    confs = []
+    methods = []
+    if method == "prototype":
+        for emb in tqdm(unl_embs, desc="predict prototype"):
+            lab, sim, sims = predict_prototype(centroids, emb)
+            if sim >= chosen_threshold:
+                preds.append(lab)
+            else:
+                preds.append("NEUTRAL")
+            confs.append(sim)
+            methods.append("prototype")
+    else:
+        # pre-normalize labeled_embs & unl_embs (should already be normalized by encode_long_text)
+        for emb in tqdm(unl_embs, desc="predict knn"):
+            lab, top_sim, top_labels = knn_predict(labeled_embs, labeled_labels, emb, k=k)
+            if top_sim >= chosen_threshold:
+                preds.append(lab)
+            else:
+                preds.append("NEUTRAL")
+            confs.append(top_sim)
+            methods.append("knn")
+
+    # Attach predictions to unlabeled_df
+    unlabeled_df = unlabeled_df.copy()
+    unlabeled_df["pred_materiality"] = preds
+    unlabeled_df["pred_confidence"] = confs
+    unlabeled_df["pred_method"] = methods
+
+    # Merge back
+    df_result = df.copy()
+    df_result["pred_materiality"] = df_result["_label_norm"]
+    # fill blanks
+    blank_idx = df_result[df_result["_label_norm"].isnull()].index
+    df_result.loc[blank_idx, "pred_materiality"] = unlabeled_df["pred_materiality"].values
+
+    # final materiality: original label if present else predicted; map None->NEUTRAL
+    df_result["final_materiality"] = df_result.apply(
+        lambda r: r["_label_norm"] if pd.notna(r["_label_norm"]) else (r["pred_materiality"] if pd.notna(r["pred_materiality"]) else "NEUTRAL"),
+        axis=1
+    )
+    df_result["final_materiality"] = df_result["final_materiality"].fillna("NEUTRAL").astype(str)
+
+    # print summary
+    print("\nFinal counts (after fill):")
+    print(df_result["final_materiality"].value_counts())
+
+    # Save to Excel
+    out_name = output_xlsx
+    df_result.to_excel(out_name, index=False)
+    print(f"\nSaved full results to {out_name}")
+
+    # Return small sanity-check sample: top N predicted blanks by confidence (highest)
+    sample_df = unlabeled_df.copy()
+    # attach raw text for easy inspection
+    sample_df[text_col] = unl_texts
+    sample_df_sorted = sample_df.sort_values("pred_confidence", ascending=False).head(30)
+    print("\nSample of top predicted blank rows (by confidence):")
+    display_cols = [text_col, "pred_materiality", "pred_confidence", "pred_method"]
+    print(sample_df_sorted[display_cols].to_string(index=False))
+    # Also write these to a separate sheet in Excel
+    try:
+        with pd.ExcelWriter(out_name, mode="a", engine="openpyxl", if_sheet_exists="replace") as writer:
+            sample_df_sorted.to_excel(writer, sheet_name="predicted_blanks_sample", index=False)
+        print(f"Saved sample predictions to sheet 'predicted_blanks_sample' in {out_name}")
+    except Exception:
+        # If append fails (engine issues), create a separate file
+        sample_name = out_name.replace(".xlsx", "_sample.xlsx")
+        sample_df_sorted.to_excel(sample_name, index=False)
+        print(f"Saved sample to {sample_name}")
+
+    return df_result, sample_df_sorted
+
+# ----------------------------
+# CLI
+# ----------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_xlsx", required=True, help="Input Excel file")
+    parser.add_argument("--sheet", default=0, help="Sheet name or index")
+    parser.add_argument("--text_col", default="call transcripts")
+    parser.add_argument("--label_col", default="materiality")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="SentenceTransformer model name")
+    parser.add_argument("--method", choices=["prototype","knn"], default=DEFAULT_METHOD)
+    parser.add_argument("--k", type=int, default=DEFAULT_K)
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--no_calibrate", action="store_true")
+    parser.add_argument("--output_xlsx", default="materiality_filled.xlsx")
+    args = parser.parse_args()
+
+    df_final, sample = fill_blanks_from_excel(
+        input_xlsx=args.input_xlsx,
+        sheet=args.sheet,
+        text_col=args.text_col,
+        label_col=args.label_col,
+        model_name=args.model,
+        method=args.method,
+        k=args.k,
+        threshold=args.threshold,
+        calibrate=(not args.no_calibrate),
+        output_xlsx=args.output_xlsx
+    )
