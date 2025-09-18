@@ -1,39 +1,72 @@
-"""
-fill_materiality_no_calib.py
+Below is a single, self-contained Python script that:
+	•	Reads your Excel file (single sheet) via pd.read_excel.
+	•	Encodes long transcripts safely using token-id chunking + mean-pooling so all-mpnet-base-v2 or intfloat/multilingual-e5-large won’t choke.
+	•	Builds labeled embeddings from your existing Materiality labels (COMPLAINT / CONCERN).
+	•	Trains a class-weighted Logistic Regression on labeled embeddings and predicts probabilities for blanks.
+	•	Uses a k-NN margin rule (conservative) to get an independent similarity signal.
+	•	Applies a conservative consensus rule to accept a label only when the classifier and k-NN agree, or when classifier probability is extremely high.
+	•	Produces final_materiality for every row and writes:
+	•	full results to Excel (all_results sheet)
+	•	top predicted blank rows to Excel sheet predicted_blanks_sample
+	•	Does not use CSV or explicitly import openpyxl (it uses pd.to_excel / ExcelWriter only).
 
-Usage example:
-python fill_materiality_no_calib.py --input_xlsx data.xlsx \
-  --text_col "call transcripts" --label_col "materiality" \
-  --model "sentence-transformers/all-mpnet-base-v2" --method prototype --threshold 0.75
+Conservative default thresholds (tuned for safety):
+	•	classifier probability threshold = 0.80 (accept only if ≥ 0.80)
+	•	classifier high-confidence accept = 0.92 (if prob ≥ 0.92 accept even if knn disagrees)
+	•	knn sim threshold = 0.82
+	•	knn margin = 0.08
+	•	knn k = 7
+
+Save as materiality_label_consensus.py and run. Adjust CLI args if needed.
+
+#!/usr/bin/env python3
+"""
+materiality_label_consensus.py
+
+Reads an Excel with columns e.g. "call transcripts" and "materiality" (values like 'Complaint'/'Concern' or blank).
+Encodes long transcripts with token-id chunking + pooling, trains a class-weighted logistic classifier on labeled
+embeddings, computes k-NN margin similarity, and assigns final labels for blanks using a conservative consensus rule.
+
+Usage:
+python materiality_label_consensus.py --input_xlsx data.xlsx --text_col "call transcripts" --label_col "materiality" \
+    --model "sentence-transformers/all-mpnet-base-v2" --output_xlsx filled.xlsx
 
 Requirements:
-  pip install sentence-transformers transformers scikit-learn pandas numpy openpyxl tqdm
+pip install sentence-transformers transformers scikit-learn pandas numpy tqdm
 """
 
 import argparse
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 from transformers import AutoTokenizer
 import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report
+import math
 
 # ----------------------------
-# Defaults
+# Conservative default settings
 # ----------------------------
 DEFAULT_MODEL = "sentence-transformers/all-mpnet-base-v2"
-DEFAULT_METHOD = "prototype"   # "prototype" or "knn"
-DEFAULT_K = 5
-DEFAULT_THRESHOLD = 0.75
+# multilingual option: "intfloat/multilingual-e5-large"
+DEFAULT_TEXT_COL = "call transcripts"
+DEFAULT_LABEL_COL = "materiality"
+DEFAULT_METHOD = "knn"   # we will use knn for margin; classifier always used
+DEFAULT_K = 7
+CLASSIFIER_PROB_THR = 0.80   # conservative accept threshold
+CLASSIFIER_HIGH_CONF = 0.92  # accept even if knn disagrees
+KNN_SIM_THR = 0.82
+KNN_MARGIN = 0.08
 BATCH_SIZE = 8
-RANDOM_STATE = 42
-SAMPLE_SIZE = 30  # how many top predicted blanks to include in sample sheet
+SAMPLE_SIZE = 40  # top predicted blanks to write to sample sheet
 
 # ----------------------------
 # Helpers
 # ----------------------------
 def normalise_label(s):
-    """Turn raw labels into 'COMPLAINT' / 'CONCERN' or None"""
     if pd.isna(s):
         return None
     s = str(s).strip().upper()
@@ -43,8 +76,7 @@ def normalise_label(s):
         return "CONCERN"
     return None
 
-def tokenize_to_id_chunks(tokenizer, text, chunk_size):
-    """Return list of token-id chunks for text (no special tokens)."""
+def tokenize_id_chunks(tokenizer, text, chunk_size):
     if not isinstance(text, str) or text.strip() == "":
         return []
     ids = tokenizer.encode(text, add_special_tokens=False)
@@ -52,86 +84,112 @@ def tokenize_to_id_chunks(tokenizer, text, chunk_size):
         return []
     return [ids[i:i+chunk_size] for i in range(0, len(ids), chunk_size)]
 
-def decode_id_chunk(tokenizer, id_chunk):
+def decode_chunk(tokenizer, id_chunk):
     return tokenizer.decode(id_chunk, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
-def encode_long_text(model, tokenizer, text, chunk_size):
+def encode_long_text(model, tokenizer, text, chunk_size, batch_size=BATCH_SIZE):
     """
-    Encode a long text by token-id chunking + decode + encode(chunks) + mean-pool.
-    Returns a normalized numpy vector (dim,).
+    Token-id chunk -> decode -> encode chunk texts -> mean pool -> return normalized numpy vector.
     """
-    # safe empty
     if not isinstance(text, str) or text.strip() == "":
         return np.zeros(model.get_sentence_embedding_dimension(), dtype=float)
 
-    id_chunks = tokenize_to_id_chunks(tokenizer, text, chunk_size)
+    id_chunks = tokenize_id_chunks(tokenizer, text, chunk_size)
     if not id_chunks:
         return np.zeros(model.get_sentence_embedding_dimension(), dtype=float)
 
-    text_chunks = [decode_id_chunk(tokenizer, c) for c in id_chunks]
-
-    # encode chunks (convert_to_tensor -> mean pool on GPU/CPU)
+    chunk_texts = [decode_chunk(tokenizer, c) for c in id_chunks]
     with torch.no_grad():
-        chunk_embs = model.encode(
-            text_chunks,
-            batch_size=BATCH_SIZE,
-            convert_to_tensor=True,
-            normalize_embeddings=True,
-            show_progress_bar=False
-        )
+        chunk_embs = model.encode(chunk_texts, batch_size=batch_size, convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False)
         pooled = torch.mean(chunk_embs, dim=0)
         pooled = pooled / (pooled.norm(p=2) + 1e-9)
         return pooled.cpu().numpy()
 
-def build_centroids(embeddings, labels):
-    """
-    embeddings: np.array (n x d)
-    labels: list/array of strings ("COMPLAINT"/"CONCERN")
-    """
-    lab_arr = np.array(labels)
+def build_centroids(embs, labels):
+    labels = np.array(labels)
     centroids = {}
-    for lab in np.unique(lab_arr):
-        mask = (lab_arr == lab)
-        if mask.sum() == 0:
-            continue
-        centroid = embeddings[mask].mean(axis=0)
-        norm = np.linalg.norm(centroid) + 1e-9
-        centroids[lab] = centroid / norm
+    for lab in np.unique(labels):
+        mask = (labels == lab)
+        centroid = embs[mask].mean(axis=0)
+        centroids[lab] = centroid / (np.linalg.norm(centroid) + 1e-9)
     return centroids
 
-def predict_prototype(centroids, emb):
-    sims = {lab: float(np.dot(centroids[lab], emb)) for lab in centroids}
-    best_lab = max(sims, key=sims.get)
-    return best_lab, sims[best_lab], sims
+def knn_margin_predict(labeled_embs, labeled_labels, unl_embs, k=7, sim_thr=KNN_SIM_THR, margin=KNN_MARGIN, batch_size=256):
+    """
+    For each unl_emb, compute similarities to labeled_embs (dot product since normalized),
+    get top-k neighbors, compute top_sim and second_sim, majority label; apply thresholds:
+    accept if top_sim >= sim_thr and (top_sim - second_sim) >= margin, else NEUTRAL.
+    Returns: preds list, top_sims list, top_labels_lists
+    """
+    # normalize to be safe
+    def l2_norm(x):
+        n = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+        return x / n
+    L = l2_norm(labeled_embs)
+    U = l2_norm(unl_embs)
 
-def knn_predict(labeled_embs, labeled_labels, emb, k=5):
-    sims = (labeled_embs @ emb)  # dot product of normalized vectors = cosine
-    top_idx = np.argsort(-sims)[:k]
-    top_labels = np.array(labeled_labels)[top_idx]
-    unique, counts = np.unique(top_labels, return_counts=True)
-    majority_label = unique[np.argmax(counts)]
-    top_sim = float(sims[top_idx[0]])
-    return majority_label, top_sim, top_labels.tolist()
+    preds = []
+    top_sims = []
+    top_labels_all = []
+
+    n = U.shape[0]
+    for start in range(0, n, batch_size):
+        end = min(n, start + batch_size)
+        sims = U[start:end] @ L.T  # (batch, n_labeled)
+        for row in sims:
+            idx_sorted = np.argsort(-row)
+            top_idx = idx_sorted[:k]
+            top_sim = float(row[top_idx[0]])
+            second_sim = float(row[top_idx[1]]) if len(row) > 1 else 0.0
+            top_labels = np.array(labeled_labels)[top_idx].tolist()
+            # majority vote
+            unique, counts = np.unique(top_labels, return_counts=True)
+            majority_label = unique[np.argmax(counts)]
+            if (top_sim >= sim_thr) and ((top_sim - second_sim) >= margin):
+                preds.append(majority_label)
+            else:
+                preds.append("NEUTRAL")
+            top_sims.append(top_sim)
+            top_labels_all.append(top_labels)
+    return preds, top_sims, top_labels_all
+
+def train_classifier(labeled_embs, labeled_labels):
+    le = LabelEncoder()
+    y_enc = le.fit_transform(labeled_labels)  # 0/1
+    clf = LogisticRegression(max_iter=2000, class_weight="balanced", solver="lbfgs", random_state=42)
+    clf.fit(labeled_embs, y_enc)
+    return clf, le
+
+def classifier_predict_with_reject(clf, label_encoder, unl_embs, prob_thr=CLASSIFIER_PROB_THR, high_conf_thr=CLASSIFIER_HIGH_CONF):
+    probs = clf.predict_proba(unl_embs)  # shape n x classes
+    top_idx = np.argmax(probs, axis=1)
+    top_probs = probs[np.arange(len(probs)), top_idx]
+    top_labels = label_encoder.inverse_transform(top_idx)
+    preds = []
+    confs = []
+    for lab, p in zip(top_labels, top_probs):
+        if p >= prob_thr:
+            preds.append(lab)
+            confs.append(float(p))
+        else:
+            preds.append("NEUTRAL")
+            confs.append(float(p))
+    # Also return raw top_probs/top_labels for possible high-confidence override
+    return preds, confs, top_labels, top_probs
 
 # ----------------------------
-# Main function
+# Main pipeline
 # ----------------------------
-def fill_blanks_from_excel_no_calib(
-    input_xlsx,
-    text_col="call transcripts",
-    label_col="materiality",
-    model_name=DEFAULT_MODEL,
-    method=DEFAULT_METHOD,
-    k=DEFAULT_K,
-    threshold=DEFAULT_THRESHOLD,
-    output_xlsx="materiality_filled.xlsx",
-    sample_size=SAMPLE_SIZE
-):
+def main(args):
     # Read Excel (single sheet)
-    df = pd.read_excel(input_xlsx)
-    if text_col not in df.columns or label_col not in df.columns:
-        raise ValueError(f"Columns not found. Available: {list(df.columns)}")
+    df = pd.read_excel(args.input_xlsx)
+    text_col = args.text_col
+    label_col = args.label_col
 
+    if text_col not in df.columns or label_col not in df.columns:
+        raise SystemExit(f"Input sheet must contain columns: '{text_col}' and '{label_col}'. Found: {list(df.columns)}")
+
+    # Normalize labels
     df = df.copy()
     df["_label_norm"] = df[label_col].apply(normalise_label)
 
@@ -140,121 +198,154 @@ def fill_blanks_from_excel_no_calib(
 
     print(f"Total rows: {len(df)} | Labeled: {len(labeled_df)} | Blanks: {len(unlabeled_df)}")
 
-    # Load model + tokenizer
-    print(f"Loading model: {model_name}")
-    model = SentenceTransformer(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    # Load model & tokenizer
+    print("Loading model:", args.model)
+    model = SentenceTransformer(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
 
-    # chunk size derived from tokenizer max length
+    # Choose chunk size from tokenizer max length
     model_max = tokenizer.model_max_length if hasattr(tokenizer, "model_max_length") else 512
     chunk_size = max(64, model_max - 10)
-    print(f"Tokenizer max length: {model_max}; using chunk_size token ids = {chunk_size}")
+    print(f"Tokenizer model_max_length={model_max}; using chunk_size={chunk_size}")
 
-    # Encode labeled with chunk pooling
-    print("Encoding labeled transcripts (chunking + pooling)...")
+    # Encode labeled texts
+    print("Encoding labeled transcripts (chunk pooling)...")
     labeled_texts = labeled_df[text_col].fillna("").astype(str).tolist()
     labeled_embs = []
     for t in tqdm(labeled_texts, desc="encode labeled"):
         labeled_embs.append(encode_long_text(model, tokenizer, t, chunk_size))
-    labeled_embs = np.vstack(labeled_embs) if len(labeled_embs) else np.zeros((0, model.get_sentence_embedding_dimension()))
+    if len(labeled_embs) == 0:
+        raise SystemExit("No labeled texts found. Cannot train classifier.")
+    labeled_embs = np.vstack(labeled_embs)
     labeled_labels = labeled_df["_label_norm"].tolist()
 
-    # Build centroids if prototype
-    centroids = None
-    if method == "prototype":
-        centroids = build_centroids(labeled_embs, labeled_labels)
+    # Train classifier (class-weighted)
+    print("Training class-weighted Logistic Regression on labeled embeddings...")
+    clf, label_encoder = train_classifier(labeled_embs, labeled_labels)
 
-    # Encode unlabeled and predict
-    print("Encoding blank transcripts and predicting...")
+    # Encode unlabeled texts (and predict)
+    print("Encoding blanks and predicting...")
     unl_texts = unlabeled_df[text_col].fillna("").astype(str).tolist()
-    preds = []
-    confs = []
-    methods = []
     unl_embs = []
-    for t in tqdm(unl_texts, desc="encode+predict blanks"):
-        emb = encode_long_text(model, tokenizer, t, chunk_size)
-        unl_embs.append(emb)
-        if method == "prototype":
-            lab, sim, sims = predict_prototype(centroids, emb)
+    for t in tqdm(unl_texts, desc="encode blanks"):
+        unl_embs.append(encode_long_text(model, tokenizer, t, chunk_size))
+    unl_embs = np.vstack(unl_embs) if len(unl_embs) else np.zeros((0, model.get_sentence_embedding_dimension()))
+
+    # Classifier predictions with reject
+    clf_preds, clf_confs, clf_top_labels, clf_top_probs = classifier_predict_with_reject(
+        clf, label_encoder, unl_embs, prob_thr=args.prob_thr, high_conf_thr=args.high_conf_thr
+    )
+
+    # k-NN margin predictions (conservative)
+    knn_preds, knn_sims, knn_top_labels = knn_margin_predict(
+        labeled_embs, labeled_labels, unl_embs, k=args.k, sim_thr=args.sim_thr, margin=args.margin
+    )
+
+    # Consensus rule: accept label only if classifier and knn agree OR classifier_prob >= high_conf_thr
+    final_preds = []
+    final_confs = []
+    for i in range(len(unl_embs)):
+        c_pred = clf_preds[i]
+        c_conf = clf_confs[i]
+        k_pred = knn_preds[i]
+        k_sim = knn_sims[i]
+        # if classifier strongly confident -> accept regardless
+        if c_pred != "NEUTRAL" and clf_top_probs[i] >= args.high_conf_thr:
+            final_preds.append(c_pred)
+            final_confs.append(float(clf_top_probs[i]))
+            continue
+        # else require agreement
+        if c_pred != "NEUTRAL" and k_pred == c_pred and k_sim >= args.sim_thr:
+            # accept
+            final_preds.append(c_pred)
+            # take conservative confidence = min(classifier_prob, knn_sim)
+            final_confs.append(float(min(clf_top_probs[i], k_sim)))
         else:
-            lab, sim, top_labels = knn_predict(labeled_embs, labeled_labels, emb, k=k)
-        pred = lab if sim >= threshold else "NEUTRAL"
-        preds.append(pred)
-        confs.append(sim)
-        methods.append(method)
+            final_preds.append("NEUTRAL")
+            final_confs.append(float(clf_top_probs[i]))
 
+    # Attach predictions back to unlabeled df
     unlabeled_df = unlabeled_df.copy()
-    unlabeled_df["pred_materiality"] = preds
-    unlabeled_df["pred_confidence"] = confs
-    unlabeled_df["pred_method"] = methods
+    unlabeled_df["pred_from_classifier"] = clf_preds
+    unlabeled_df["clf_confidence"] = clf_confs
+    unlabeled_df["pred_from_knn"] = knn_preds
+    unlabeled_df["knn_sim"] = knn_sims
+    unlabeled_df["final_pred"] = final_preds
+    unlabeled_df["final_confidence"] = final_confs
 
-    # Merge back into full df
+    # Merge to full df
     df_result = df.copy()
     df_result["pred_materiality"] = df_result["_label_norm"]
     blank_idx = df_result[df_result["_label_norm"].isnull()].index
-    df_result.loc[blank_idx, "pred_materiality"] = unlabeled_df["pred_materiality"].values
-
+    df_result.loc[blank_idx, "pred_materiality"] = unlabeled_df["final_pred"].values
     df_result["final_materiality"] = df_result.apply(
         lambda r: r["_label_norm"] if pd.notna(r["_label_norm"]) else (r["pred_materiality"] if pd.notna(r["pred_materiality"]) else "NEUTRAL"),
         axis=1
     )
     df_result["final_materiality"] = df_result["final_materiality"].fillna("NEUTRAL").astype(str)
 
-    print("\nCounts after fill:")
+    # Print counts and quality diagnostics
+    print("\nCounts BEFORE (original labeled):")
+    print(pd.Series(labeled_labels).value_counts())
+    print("\nCounts AFTER filling (final_materiality):")
     print(df_result["final_materiality"].value_counts())
 
-    # Save to Excel with extra sheet for top N predicted blanks
-    out_name = output_xlsx
-    try:
-        with pd.ExcelWriter(out_name, engine="openpyxl") as writer:
-            df_result.to_excel(writer, sheet_name="all_results", index=False)
-            # top predicted blanks sample by confidence
-            sample_df = unlabeled_df.copy()
-            sample_df[text_col] = unl_texts
-            sample_sorted = sample_df.sort_values("pred_confidence", ascending=False).head(sample_size)
-            sample_sorted.to_excel(writer, sheet_name="predicted_blanks_sample", index=False)
-        print(f"Saved results and sample to {out_name}")
-    except Exception as e:
-        # fallback to CSV if Excel write fails
-        print(f"Excel write failed ({e}); falling back to CSV.")
-        df_result.to_csv(out_name.replace(".xlsx", ".csv"), index=False)
-        unlabeled_df.sort_values("pred_confidence", ascending=False).head(sample_size).to_csv(
-            out_name.replace(".xlsx", "_sample.csv"), index=False
-        )
-        print("Saved CSV outputs.")
+    print("\nClassifier performance on labeled set (train) - diagnostic:")
+    y_train_enc = label_encoder.transform(labeled_labels)
+    y_train_pred_enc = clf.predict(labeled_embs)
+    print(classification_report(y_train_enc, y_train_pred_enc, target_names=label_encoder.classes_))
 
-    # Print short sample to console
-    print("\nTop predicted blanks (console sample):")
-    sample_console = unlabeled_df.copy()
-    sample_console[text_col] = unl_texts
-    print(sample_console.sort_values("pred_confidence", ascending=False).head(10)[[text_col, "pred_materiality", "pred_confidence"]].to_string(index=False))
+    # Save full results and sample predicted blanks to Excel
+    out_name = args.output_xlsx
+    print(f"\nSaving results to {out_name} ...")
+    # sheet1: all results, sheet2: predicted blanks sample
+    with pd.ExcelWriter(out_name) as writer:
+        df_result.to_excel(writer, sheet_name="all_results", index=False)
+        sample_df = unlabeled_df.copy()
+        sample_df[ text_col ] = unl_texts
+        sample_sorted = sample_df.sort_values("final_confidence", ascending=False).head(SAMPLE_SIZE)
+        sample_sorted.to_excel(writer, sheet_name="predicted_blanks_sample", index=False)
 
-    return df_result, unlabeled_df
+    print("Done. Top predicted blanks sample (console):")
+    if len(unlabeled_df) > 0:
+        print(sample_sorted[[text_col, "final_pred", "final_confidence"]].to_string(index=False))
+    else:
+        print("No blank rows found.")
 
 # ----------------------------
 # CLI
 # ----------------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--input_xlsx", default="data.xlsx", help="Input Excel file (single sheet)")
-    p.add_argument("--text_col", default="call transcripts")
-    p.add_argument("--label_col", default="materiality")
+    p.add_argument("--input_xlsx", required=True, help="Input Excel file (single sheet).")
+    p.add_argument("--text_col", default=DEFAULT_TEXT_COL)
+    p.add_argument("--label_col", default=DEFAULT_LABEL_COL)
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--method", choices=["prototype", "knn"], default=DEFAULT_METHOD)
     p.add_argument("--k", type=int, default=DEFAULT_K)
-    p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
-                   help="Similarity threshold (no calibration in this script)")
+    p.add_argument("--prob_thr", type=float, default=CLASSIFIER_PROB_THR,
+                   help="Classifier probability threshold to accept label (conservative).")
+    p.add_argument("--high_conf_thr", type=float, default=CLASSIFIER_HIGH_CONF,
+                   help="Very high classifier prob to accept label regardless of knn.")
+    p.add_argument("--sim_thr", type=float, default=KNN_SIM_THR,
+                   help="k-NN top similarity threshold to accept a neighbor-based label.")
+    p.add_argument("--margin", type=float, default=KNN_MARGIN, help="k-NN top-second margin required.")
     p.add_argument("--output_xlsx", default="materiality_filled.xlsx")
     args = p.parse_args()
+    # pass args to main
+    main(args)
 
-    fill_blanks_from_excel_no_calib(
-        input_xlsx=args.input_xlsx,
-        text_col=args.text_col,
-        label_col=args.label_col,
-        model_name=args.model,
-        method=args.method,
-        k=args.k,
-        threshold=args.threshold,
-        output_xlsx=args.output_xlsx,
-        sample_size=SAMPLE_SIZE
-    )
+Notes and tips
+	•	This script deliberately errs on the side of NEUTRAL by using conservative thresholds and requiring agreement between two independent signals (classifier and k-NN) unless classifier is extremely confident.
+	•	Encoding long texts is the slowest step. If you have a GPU and sentence-transformers sees it, encoding will be far faster. Set CUDA_VISIBLE_DEVICES if required.
+	•	After you run, inspect the predicted_blanks_sample sheet in the output Excel to validate predictions before using them downstream. If you want even more conservative behavior, raise --prob_thr or --sim_thr values.
+	•	If you want me to change thresholds or make the consensus rule stricter (e.g., require knn majority label to be unanimous or require 2-of-3 ensemble), tell me which rule and I’ll update the script.
+
+
+
+problem with earlier code:
+Here’s what’s happening and exactly how to fix it (with code you can drop into your pipeline).
+
+Short diagnosis
+	•	Prototype/centroid or single-nearest methods will always assign a label (unless you use a strict threshold). With many unlabeled rows and a conservative threshold that’s too low, most blanks get assigned to whichever class centroid is closest — which can produce large shifts away from the original labelled proportions.
+	•	If the labelled pool is imbalanced (you had ~1,655 concerns vs 844 complaints), centroids and k-NN votes will bias toward the larger class.
+	•	Long transcripts, chunking/pooling or noisy embeddings can reduce separability; without a proper decision function that accounts for class priors and calibrated confidence you’ll see exactly the “everything becomes class A” behaviour.
