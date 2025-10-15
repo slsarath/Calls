@@ -1,0 +1,304 @@
+Copy and paste this into a .py or notebook cell — it’s self-contained and ready to run. Install optional libs for better results (sentence-transformers, rapidfuzz) but they are not required.
+
+"""
+LRR -> Control matching toolkit
+Returns top-k controls for each LRR using multiple similarity methods:
+ - semantic (sentence-transformers optional; fallback: TF-IDF + SVD)
+ - n-gram overlap
+ - jaccard token similarity
+ - fuzzy string matching (rapidfuzz optional; fallback: difflib)
+ - regex citation matching
+ - phrase matching (contiguous token sequences)
+Outputs a DataFrame with one row per matched (LRR, Control) pair and per-method scores.
+"""
+
+import re
+from typing import List, Dict, Optional
+import numpy as np
+import pandas as pd
+
+# sklearn is required for TF-IDF fallback
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity
+from difflib import SequenceMatcher
+
+# ------------------ Text utilities ------------------
+def preprocess_text(text: Optional[str]) -> str:
+    if pd.isna(text) or text is None:
+        return ""
+    s = str(text)
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def tokenize(text: str) -> List[str]:
+    return [t for t in re.findall(r"\w+", text.lower()) if t]
+
+def ngrams(tokens: List[str], n: int) -> List[str]:
+    if len(tokens) < n:
+        return []
+    return [" ".join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+
+# ------------------ Embeddings / semantic ------------------
+def get_sentence_transformer_embeddings(texts: List[str], model_name: str = "all-MiniLM-L6-v2"):
+    """
+    Requires sentence-transformers installed. Returns numpy array of embeddings.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception as e:
+        raise ImportError("Install sentence-transformers to use this semantic mode: pip install -U sentence-transformers") from e
+    model = SentenceTransformer(model_name)
+    embs = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    return embs
+
+def tfidf_svd_embeddings(corpus: List[str], n_components: int = 200):
+    """
+    TF-IDF + TruncatedSVD fallback to produce dense vectors for semantic-like matching.
+    """
+    vectorizer = TfidfVectorizer(max_df=0.9, min_df=1, ngram_range=(1,2))
+    X = vectorizer.fit_transform(corpus)
+    # choose n_components safely
+    max_possible = max(1, min(n_components, X.shape[1] - 1 if X.shape[1] > 1 else 1))
+    svd = TruncatedSVD(n_components=max_possible, random_state=42)
+    X_reduced = svd.fit_transform(X)
+    return X_reduced, vectorizer, svd
+
+# ------------------ Similarity measures ------------------
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+        return 0.0
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+def jaccard_tokens(a: str, b: str) -> float:
+    ta = set(tokenize(a))
+    tb = set(tokenize(b))
+    if not ta and not tb:
+        return 0.0
+    inter = ta & tb
+    uni = ta | tb
+    return len(inter) / len(uni)
+
+def ngram_overlap_score(a: str, b: str, max_n: int = 3) -> float:
+    ta = tokenize(a); tb = tokenize(b)
+    scores = []
+    for n in range(1, max_n+1):
+        ga = set(ngrams(ta, n))
+        gb = set(ngrams(tb, n))
+        if not ga and not gb:
+            scores.append(0.0)
+        else:
+            scores.append(len(ga & gb) / max(1, len(ga | gb)))
+    # weight more on higher n-grams
+    weights = [0.2, 0.3, 0.5][:len(scores)]
+    return float(np.dot(scores, weights))
+
+def fuzzy_ratio(a: str, b: str) -> float:
+    try:
+        from rapidfuzz import fuzz
+        return fuzz.token_sort_ratio(a, b) / 100.0
+    except Exception:
+        return SequenceMatcher(None, a, b).ratio()
+
+def regex_section_match_score(a: str, b: str) -> float:
+    """
+    Extract patterns like '12 CFR 1026.9', '1026.9(c)(2)(v)(B)', and raw numeric decimals.
+    Score is fraction of LRR references that appear in the control text.
+    """
+    pattern = r"\b\d+\s*CFR\s*\d+(?:\.\d+)*(?:\([a-z0-9]+\))*\b|\b\d+(?:\.\d+){1,}\b"
+    refs_a = set(re.findall(pattern, a, flags=re.IGNORECASE))
+    refs_b = set(re.findall(pattern, b, flags=re.IGNORECASE))
+    if not refs_a or not refs_b:
+        return 0.0
+    return len(refs_a & refs_b) / len(refs_a)
+
+def phrase_match_count(a: str, b: str, min_phrase_len: int = 3) -> float:
+    ta = tokenize(a); tb = tokenize(b)
+    if len(ta) < min_phrase_len or len(tb) < min_phrase_len:
+        return 0.0
+    matches = 0
+    total = 0
+    for n in range(min_phrase_len, min(6, len(ta))+1):
+        sa = set(ngrams(ta, n))
+        sb = set(ngrams(tb, n))
+        if sa or sb:
+            common = sa & sb
+            matches += len(common)
+            total += max(1, len(sa | sb))
+    if total == 0:
+        return 0.0
+    return matches / total
+
+# ------------------ normalization & composition ------------------
+def normalize_arr(x: np.ndarray) -> np.ndarray:
+    x = np.array(x, dtype=float)
+    if x.max() == x.min():
+        # if all zeros, keep zeros; if non-zero constant, return ones
+        return np.zeros_like(x) if x.max() == 0 else np.ones_like(x)
+    return (x - x.min()) / (x.max() - x.min())
+
+# ------------------ main matching function ------------------
+def match_controls_for_lrr(
+    lrr_text: str,
+    controls_df: pd.DataFrame,
+    control_text_col: str = "Control Description",
+    methods: List[str] = None,
+    top_k: int = 3,
+    weights: Dict[str, float] = None,
+    use_sentence_transformer: bool = False
+) -> pd.DataFrame:
+    """
+    Returns DataFrame with top_k controls and per-method raw + normalized scores for a single LRR text.
+    """
+    if methods is None:
+        methods = ["semantic", "ngram", "jaccard", "fuzzy", "regex", "phrase"]
+    controls = controls_df.copy().reset_index(drop=True)
+    controls["_txt"] = controls[control_text_col].fillna("").apply(preprocess_text)
+    query = preprocess_text(lrr_text)
+
+    # prepare semantic embeddings if requested
+    if "semantic" in methods:
+        try:
+            if use_sentence_transformer:
+                all_texts = [query] + controls["_txt"].tolist()
+                embs = get_sentence_transformer_embeddings(all_texts)
+                emb_query = embs[0]
+                emb_controls = np.vstack(embs[1:])
+            else:
+                corpus = [query] + controls["_txt"].tolist()
+                X_reduced, vect, svd = tfidf_svd_embeddings(corpus, n_components=100)
+                emb_query = X_reduced[0]
+                emb_controls = X_reduced[1:]
+            # compute cosine similarity vectorized
+            sem_scores = cosine_similarity(emb_controls, emb_query.reshape(1, -1)).flatten()
+            controls["semantic"] = sem_scores
+        except Exception as e:
+            # on failure, assign zeros and continue
+            controls["semantic"] = 0.0
+
+    # other methods
+    if "ngram" in methods:
+        controls["ngram"] = controls["_txt"].apply(lambda x: ngram_overlap_score(query, x))
+    if "jaccard" in methods:
+        controls["jaccard"] = controls["_txt"].apply(lambda x: jaccard_tokens(query, x))
+    if "fuzzy" in methods:
+        controls["fuzzy"] = controls["_txt"].apply(lambda x: fuzzy_ratio(query, x))
+    if "regex" in methods:
+        controls["regex"] = controls["_txt"].apply(lambda x: regex_section_match_score(query, x))
+    if "phrase" in methods:
+        controls["phrase"] = controls["_txt"].apply(lambda x: phrase_match_count(query, x))
+
+    # collect score columns and normalize
+    score_cols = [c for c in ["semantic", "ngram", "jaccard", "fuzzy", "regex", "phrase"] if c in controls.columns]
+    for c in score_cols:
+        controls[c + "_norm"] = normalize_arr(controls[c].fillna(0).values)
+
+    # default weights per method (tune as needed)
+    if weights is None:
+        weights = {
+            "semantic": 3.0,
+            "ngram": 1.0,
+            "jaccard": 0.5,
+            "fuzzy": 0.5,
+            "regex": 2.0,
+            "phrase": 1.0
+        }
+    # compute composite using normalized scores
+    comp = np.zeros(len(controls), dtype=float)
+    total_w = 0.0
+    for method, w in weights.items():
+        col = method + "_norm"
+        if col in controls.columns:
+            comp += controls[col].values * float(w)
+            total_w += float(w)
+    if total_w > 0:
+        comp = comp / total_w
+    controls["composite_score"] = comp
+
+    # select top_k
+    top = controls.sort_values("composite_score", ascending=False).head(top_k).reset_index(drop=True)
+
+    # return useful columns
+    ret_cols = ["ControlId", control_text_col] + score_cols + [c + "_norm" for c in score_cols] + ["composite_score"]
+    # some control dfs might not have ControlId; handle generically
+    if "ControlId" not in top.columns:
+        top.insert(0, "ControlId", top.index.astype(str))
+    return top[[c for c in ret_cols if c in top.columns]]
+
+# ------------------ batch run for all LRRs ------------------
+def match_all_lrrs(
+    laws_df: pd.DataFrame,
+    controls_df: pd.DataFrame,
+    lrr_id_col: str = "LRRid",
+    lrr_text_col: str = "Detailed obligation description",
+    control_text_col: str = "Control Description",
+    methods: List[str] = None,
+    top_k: int = 3,
+    weights: Dict[str, float] = None,
+    use_sentence_transformer: bool = False,
+) -> pd.DataFrame:
+    """
+    For each LRR in laws_df, find top_k matching controls and return a long-format DataFrame:
+    columns: LRRid, LRR_text, rank, ControlId, Control Description, per-method scores, composite_score
+    """
+    rows = []
+    for idx, row in laws_df.reset_index(drop=True).iterrows():
+        lrrid = row.get(lrr_id_col, idx)
+        lrr_text = preprocess_text(row.get(lrr_text_col, ""))
+        matched = match_controls_for_lrr(
+            lrr_text,
+            controls_df,
+            control_text_col=control_text_col,
+            methods=methods,
+            top_k=top_k,
+            weights=weights,
+            use_sentence_transformer=use_sentence_transformer,
+        )
+        for rank_idx, m in matched.reset_index(drop=True).iterrows():
+            out = {
+                lrr_id_col: lrrid,
+                lrr_text_col: lrr_text,
+                "rank": rank_idx + 1
+            }
+            # copy matched columns
+            for c in matched.columns:
+                out[c] = matched.at[rank_idx, c]
+            rows.append(out)
+    return pd.DataFrame(rows)
+
+# ------------------ usage example ------------------
+if __name__ == "__main__":
+    # Example demo. Replace with your actual file loading.
+    demo_laws = pd.DataFrame([
+        {"LRRid": "LRR001", "Detailed obligation description": """
+            LYOD is not required to provide customers with notifications of changes that are increases to APRs or fees upon the expiration of a specified period of time,
+            provided LYOD has satisfied the conditions laid out in 12 CFR 1026.9(c)(2)(v)(B). For increases in rates due to delinquency or default, LYOD must provide a written notice
+            at least 45 days in advance with reasons and affected balances.
+        """}
+    ])
+    demo_controls = pd.DataFrame([
+        {"ControlId": "C001", "Control Description": "Notify customers in writing of APR changes after promotional period ends as per 12 CFR 1026.9(c)(2)(v)(B). 45 days notice for default rates."},
+        {"ControlId": "C002", "Control Description": "System validates APR calculations and posts changes to customer accounts. No specific regulatory citation."},
+        {"ControlId": "C003", "Control Description": "Customer communications team to send statements of rate changes. Includes reasons and affected balances; follows 12 CFR 1026.9(g)(3)(ii) formatting."},
+        {"ControlId": "C004", "Control Description": "Password rotation and IT access controls unrelated to APR or consumer notices."}
+    ])
+
+    # Run batch matching (demo)
+    matches = match_all_lrrs(demo_laws, demo_controls, top_k=3, use_sentence_transformer=False)
+    print(matches.to_string(index=False))
+
+    # To run on your real dataframes:
+    # laws_df = pd.read_csv("laws.csv")  # must contain LRRid and Detailed obligation description
+    # controls_df = pd.read_csv("controls.csv")  # must contain ControlId and Control Description
+    # matches = match_all_lrrs(laws_df, controls_df, top_k=3, use_sentence_transformer=True)
+    # matches.to_csv("lrr_control_matches.csv", index=False)
+
+"""
+Optional installs to improve quality:
+pip install -U sentence-transformers rapidfuzz
+
+Notes:
+- If your corpus is large, prefer sentence-transformers and batch encoding for performance.
+- Tune `weights` in match_controls_for_lrr or match_all_lrrs to prioritize citations (regex) or semantic similarity.
+"""
